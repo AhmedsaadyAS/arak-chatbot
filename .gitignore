@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Environment variables
+.env
+
+# Tests
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+
+# Data
+data/*.csv
+data/*.xlsx
+!data/intents.json
+
+# IDE
+.vscode/
+.idea/
