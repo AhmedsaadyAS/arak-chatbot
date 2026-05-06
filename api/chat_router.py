@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from api.arak_client import ArakClient
-from api.gemini_service import GeminiService
+from api.ai_service import AIService, ModelConfig
 from api.auth_middleware import get_current_user
 import re
 from datetime import date
@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 
 router = APIRouter()
 arak_client = ArakClient()
-gemini = GeminiService()
+ai = AIService()
 
 # ── RBAC Configuration ─────────────────────────────────────────────
 
@@ -35,6 +35,7 @@ BLOCKED_ROLES = {"Student"}
 class ChatRequest(BaseModel):
     message: str
     token: Optional[str] = None
+    model_config_data: Optional[dict] = None
 
 
 def check_rbac(role: str, intent: str) -> bool:
@@ -86,7 +87,7 @@ async def _resolve_class_id(lookup: str, token: str):
 
 # ── Intent Handlers ─────────────────────────────────────────────────
 
-async def handle_attendance_query(entities: Dict, token: str, message: str) -> str:
+async def handle_attendance_query(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     cid = entities.get("classId")
     if not cid and entities.get("classLookup"):
         cid = await _resolve_class_id(entities["classLookup"], token)
@@ -94,33 +95,33 @@ async def handle_attendance_query(entities: Dict, token: str, message: str) -> s
         data = await arak_client.get_attendance_by_class(cid, token)
         if isinstance(data, dict) and "error" in data:
             return "لم أتمكن من جلب بيانات الحضور. تأكد من رقم الفصل."
-        return await gemini.format_response("attendance_query", data, message)
+        return await ai.format_response("attendance_query", data, message, config=mc)
     return "من فضلك حدد رقم الفصل (مثال: غياب الفصل 1)."
 
 
-async def handle_student_grade(entities: Dict, token: str, message: str) -> str:
+async def handle_student_grade(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     sid = entities.get("studentId")
     if sid:
         data = await arak_client.get_student_grades(sid, token)
         if isinstance(data, list) and data:
-            return await gemini.format_response("student_grade", data, message)
+            return await ai.format_response("student_grade", data, message, config=mc)
         return "لا توجد درجات مسجلة لهذا الطالب."
     return "من فضلك حدد رقم الطالب (مثال: درجات الطالب 5)."
 
 
-async def handle_schedule_query(entities: Dict, token: str, message: str) -> str:
+async def handle_schedule_query(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     cid = entities.get("classId")
     if not cid and entities.get("classLookup"):
         cid = await _resolve_class_id(entities["classLookup"], token)
     if cid:
         data = await arak_client.get_schedules_by_class(cid, token)
         if isinstance(data, list) and data:
-            return await gemini.format_response("schedule_query", data, message)
+            return await ai.format_response("schedule_query", data, message, config=mc)
         return "لا يوجد جدول حصص لهذا الفصل."
     return "من فضلك حدد رقم الفصل (مثال: جدول الفصل 1)."
 
 
-async def handle_top_absentees(token: str, message: str) -> str:
+async def handle_top_absentees(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     """Find students with the most absences."""
     classes = await arak_client.get_classes(token=token)
     if not isinstance(classes, list):
@@ -151,13 +152,14 @@ async def handle_top_absentees(token: str, message: str) -> str:
         return "لا توجد سجلات غياب حاليًا."
 
     top_5 = sorted(absence_counts.values(), key=lambda x: x["count"], reverse=True)[:5]
-    return await gemini.analyze_data(
+    return await ai.analyze_data(
         "حلل بيانات أكثر الطلاب غيابًا وقدم توصيات لتحسين الحضور:",
         {"top_absentees": top_5},
+        config=mc,
     )
 
 
-async def handle_weak_students(entities: Dict, token: str, message: str) -> str:
+async def handle_weak_students(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     """Find students with low grades (below 50)."""
     evals = await arak_client.get_all_evaluations(token)
     if not isinstance(evals, list):
@@ -186,13 +188,14 @@ async def handle_weak_students(entities: Dict, token: str, message: str) -> str:
         return "لا يوجد طلاب بدرجات أقل من 50 حاليًا. 🎉"
 
     weak.sort(key=lambda x: x["grade"])
-    return await gemini.analyze_data(
+    return await ai.analyze_data(
         "حلل بيانات الطلاب ذوي الأداء الضعيف (أقل من 50 درجة) وقدم توصيات:",
         {"weak_students": weak[:20], "total_count": len(weak)},
+        config=mc,
     )
 
 
-async def handle_class_summary(entities: Dict, token: str, message: str) -> str:
+async def handle_class_summary(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     """Comprehensive class summary: attendance + grades + tasks."""
     cid = entities.get("classId")
     if not cid and entities.get("classLookup"):
@@ -223,13 +226,14 @@ async def handle_class_summary(entities: Dict, token: str, message: str) -> str:
         "tasks_sample": class_tasks[:5],
     }
 
-    return await gemini.analyze_data(
+    return await ai.analyze_data(
         f"قدم ملخصًا شاملًا للفصل رقم {cid} يشمل: الحضور، الدرجات، المهام، وتوصيات لتحسين الأداء:",
         summary_data,
+        config=mc,
     )
 
 
-async def handle_unpaid_fees(token: str, message: str) -> str:
+async def handle_unpaid_fees(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     """Find students with unpaid fees."""
     fees = await arak_client.get_all_fees(token)
     if not isinstance(fees, list):
@@ -250,13 +254,14 @@ async def handle_unpaid_fees(token: str, message: str) -> str:
     if not unpaid:
         return "جميع الرسوم مدفوعة! ✅"
 
-    return await gemini.analyze_data(
+    return await ai.analyze_data(
         "حلل بيانات الرسوم غير المدفوعة وقدم ملخصًا:",
         {"unpaid_fees": unpaid[:20], "total_unpaid": len(unpaid)},
+        config=mc,
     )
 
 
-async def handle_daily_summary(token: str, message: str) -> str:
+async def handle_daily_summary(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     """Today's summary: attendance + events."""
     today = date.today().isoformat()
 
@@ -297,13 +302,14 @@ async def handle_daily_summary(token: str, message: str) -> str:
         "events": today_events[:5],
     }
 
-    return await gemini.analyze_data(
+    return await ai.analyze_data(
         f"قدم ملخص اليوم ({today}) للمدرسة يشمل: إجمالي الحضور والغياب لكل فصل، والأحداث المقررة:",
         summary_data,
+        config=mc,
     )
 
 
-async def handle_fee_status(entities: Dict, token: str, message: str) -> str:
+async def handle_fee_status(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     sid = entities.get("studentId")
     fees = await arak_client.get_all_fees(token)
     if not isinstance(fees, list):
@@ -311,12 +317,12 @@ async def handle_fee_status(entities: Dict, token: str, message: str) -> str:
     if sid:
         student_fees = [f for f in fees if str(f.get("studentId")) == str(sid)]
         if student_fees:
-            return await gemini.format_response("fee_status", student_fees, message)
+            return await ai.format_response("fee_status", student_fees, message, config=mc)
         return f"لا توجد رسوم مسجلة للطالب رقم {sid}."
     return "من فضلك حدد رقم الطالب (مثال: رسوم الطالب 5)."
 
 
-async def handle_task_status(entities: Dict, token: str, message: str) -> str:
+async def handle_task_status(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     tasks = await arak_client.get_all_tasks(token)
     if not isinstance(tasks, list):
         return "لم أتمكن من جلب المهام."
@@ -324,53 +330,54 @@ async def handle_task_status(entities: Dict, token: str, message: str) -> str:
     if cid:
         tasks = [t for t in tasks if str(t.get("classId")) == str(cid)]
     if tasks:
-        return await gemini.format_response("task_status", tasks[:15], message)
+        return await ai.format_response("task_status", tasks[:15], message, config=mc)
     return "لا توجد مهام حاليًا."
 
 
-async def handle_event_query(token: str, message: str) -> str:
+async def handle_event_query(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     events = await arak_client.get_events(token)
     if isinstance(events, list) and events:
-        return await gemini.format_response("event_query", events[:10], message)
+        return await ai.format_response("event_query", events[:10], message, config=mc)
     return "لا توجد أحداث مسجلة حاليًا."
 
 
-async def handle_class_info(entities: Dict, token: str, message: str) -> str:
+async def handle_class_info(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     classes = await arak_client.get_classes(token=token)
     if isinstance(classes, list) and classes:
         cid = entities.get("classId")
         if cid:
             cls = next((c for c in classes if c.get("id") == cid), None)
             if cls:
-                return await gemini.format_response("class_info", cls, message)
+                return await ai.format_response("class_info", cls, message, config=mc)
             return f"الفصل رقم {cid} غير موجود."
-        return await gemini.format_response("class_info", classes, message)
+        return await ai.format_response("class_info", classes, message, config=mc)
     return "لم أتمكن من جلب بيانات الفصول."
 
 
-async def handle_teacher_query(token: str, message: str) -> str:
+async def handle_teacher_query(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     teachers = await arak_client.get_all_teachers(token)
     if isinstance(teachers, list) and teachers:
-        return await gemini.format_response("teacher_query", teachers[:15], message)
+        return await ai.format_response("teacher_query", teachers[:15], message, config=mc)
     return "لم أتمكن من جلب بيانات المعلمين."
 
 
 # ── Intent → Handler mapping ────────────────────────────────────────
+# All handlers accept (entities, token, message, mc)
 
 INTENT_HANDLERS = {
-    "attendance_query": lambda e, t, m: handle_attendance_query(e, t, m),
-    "student_grade":    lambda e, t, m: handle_student_grade(e, t, m),
-    "schedule_query":   lambda e, t, m: handle_schedule_query(e, t, m),
-    "top_absentees":    lambda e, t, m: handle_top_absentees(t, m),
-    "weak_students":    lambda e, t, m: handle_weak_students(e, t, m),
-    "class_summary":    lambda e, t, m: handle_class_summary(e, t, m),
-    "unpaid_fees":      lambda e, t, m: handle_unpaid_fees(t, m),
-    "daily_summary":    lambda e, t, m: handle_daily_summary(t, m),
-    "fee_status":       lambda e, t, m: handle_fee_status(e, t, m),
-    "task_status":      lambda e, t, m: handle_task_status(e, t, m),
-    "event_query":      lambda e, t, m: handle_event_query(t, m),
-    "class_info":       lambda e, t, m: handle_class_info(e, t, m),
-    "teacher_query":    lambda e, t, m: handle_teacher_query(t, m),
+    "attendance_query": lambda e, t, m, mc: handle_attendance_query(e, t, m, mc),
+    "student_grade":    lambda e, t, m, mc: handle_student_grade(e, t, m, mc),
+    "schedule_query":   lambda e, t, m, mc: handle_schedule_query(e, t, m, mc),
+    "top_absentees":    lambda e, t, m, mc: handle_top_absentees(t, m, mc),
+    "weak_students":    lambda e, t, m, mc: handle_weak_students(e, t, m, mc),
+    "class_summary":    lambda e, t, m, mc: handle_class_summary(e, t, m, mc),
+    "unpaid_fees":      lambda e, t, m, mc: handle_unpaid_fees(t, m, mc),
+    "daily_summary":    lambda e, t, m, mc: handle_daily_summary(t, m, mc),
+    "fee_status":       lambda e, t, m, mc: handle_fee_status(e, t, m, mc),
+    "task_status":      lambda e, t, m, mc: handle_task_status(e, t, m, mc),
+    "event_query":      lambda e, t, m, mc: handle_event_query(t, m, mc),
+    "class_info":       lambda e, t, m, mc: handle_class_info(e, t, m, mc),
+    "teacher_query":    lambda e, t, m, mc: handle_teacher_query(t, m, mc),
 }
 
 
@@ -380,6 +387,9 @@ async def chat(request: ChatRequest, user: Dict[str, Any] = Depends(get_current_
     token = user.get("token", "")
     role = user.get("role", "")
 
+    # Build per-request ModelConfig
+    mc = ModelConfig(**(request.model_config_data or {}))
+
     # Block Student role
     if role in BLOCKED_ROLES:
         return {
@@ -388,8 +398,8 @@ async def chat(request: ChatRequest, user: Dict[str, Any] = Depends(get_current_
             "entities": {},
         }
 
-    # 1. Classify intent using Gemini
-    intent = await gemini.classify_intent(msg)
+    # 1. Classify intent using multi-layer AI
+    intent, layer = await ai.classify_intent(msg, config=mc)
 
     # 2. RBAC check
     if not check_rbac(role, intent):
@@ -405,10 +415,20 @@ async def chat(request: ChatRequest, user: Dict[str, Any] = Depends(get_current_
     # 4. Execute handler
     handler = INTENT_HANDLERS.get(intent)
     if handler:
-        reply = await handler(entities, token, msg)
+        reply = await handler(entities, token, msg, mc)
     elif intent == "greeting":
-        reply = f"أهلاً وسهلاً! 👋 أنا مساعد أراك الذكي. كيف يمكنني مساعدتك اليوم؟"
+        reply = "أهلاً وسهلاً! 👋 أنا مساعد أراك الذكي. كيف يمكنني مساعدتك اليوم؟"
     else:
         reply = "لم أفهم طلبك بوضوح. يمكنني مساعدتك في:\n• حضور وغياب الطلاب\n• الدرجات والتقييمات\n• جدول الحصص\n• تحليل الأداء والطلاب الضعفاء\n• ملخص الفصل أو اليوم\n• الرسوم غير المدفوعة"
 
     return {"reply": reply, "intent": intent, "entities": entities}
+
+
+@router.get("/chat/layers")
+async def get_active_layers():
+    """Return the default layer configuration for the dashboard settings panel."""
+    default_mc = ModelConfig()
+    return {
+        "layers": ai.get_active_layers(default_mc),
+        "defaults": default_mc.model_dump(),
+    }

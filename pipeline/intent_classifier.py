@@ -1,11 +1,8 @@
-import pandas as pd
 import numpy as np
 import joblib
 import os
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
 from pipeline.preprocessor import preprocess
 from pipeline.embedder import Embedder
 
@@ -19,6 +16,9 @@ class IntentClassifier:
         self.embedder = Embedder(model_dir)
 
     def train(self, dataset_path: str = "data/dataset.csv"):
+        import pandas as pd
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import classification_report
         print(f"Loading dataset from {dataset_path}...")
         df = pd.read_csv(dataset_path)
         
