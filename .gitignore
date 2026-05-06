@@ -24,3 +24,7 @@ data/*.xlsx
 # IDE
 .vscode/
 .idea/
+
+# Models
+models/
+./models/

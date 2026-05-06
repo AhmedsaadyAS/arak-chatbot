@@ -22,18 +22,22 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from groq import AsyncGroq
 
 load_dotenv()
 
 # ── .env defaults ────────────────────────────────────────────────────
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
+DEFAULT_ENABLE_GROQ = os.getenv("ENABLE_GROQ", "true").lower() == "true"
 DEFAULT_ENABLE_GEMINI_LITE = os.getenv("ENABLE_GEMINI_LITE", "true").lower() == "true"
 DEFAULT_ENABLE_GEMINI_FLASH = os.getenv("ENABLE_GEMINI_FLASH", "true").lower() == "true"
 DEFAULT_ENABLE_OLLAMA = os.getenv("ENABLE_OLLAMA", "true").lower() == "true"
 DEFAULT_ENABLE_SKLEARN = os.getenv("ENABLE_SKLEARN", "true").lower() == "true"
 
+DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 DEFAULT_GEMINI_LITE_MODEL = os.getenv("GEMINI_LITE_MODEL", "gemini-2.0-flash-lite")
 DEFAULT_GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", "gemini-1.5-flash")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
@@ -79,10 +83,12 @@ ANALYSIS_SYSTEM_PROMPT = """
 # ── Per-request model config ─────────────────────────────────────────
 
 class ModelConfig(BaseModel):
+    enable_groq: bool = DEFAULT_ENABLE_GROQ
     enable_gemini_lite: bool = DEFAULT_ENABLE_GEMINI_LITE
     enable_gemini_flash: bool = DEFAULT_ENABLE_GEMINI_FLASH
     enable_ollama: bool = DEFAULT_ENABLE_OLLAMA
     enable_sklearn: bool = DEFAULT_ENABLE_SKLEARN
+    groq_model: str = DEFAULT_GROQ_MODEL
     gemini_lite_model: str = DEFAULT_GEMINI_LITE_MODEL
     gemini_flash_model: str = DEFAULT_GEMINI_FLASH_MODEL
     ollama_model: str = DEFAULT_OLLAMA_MODEL
@@ -196,6 +202,19 @@ async def _call_ollama(model: str, url: str, prompt: str, temperature: float) ->
     return data.get("response", "").strip()
 
 
+# ── Groq call ────────────────────────────────────────────────────────
+
+async def _call_groq(prompt: str, api_key: str) -> str:
+    client = AsyncGroq(api_key=api_key)
+    response = await client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1000,
+        temperature=0.3,
+    )
+    return response.choices[0].message.content.strip()
+
+
 # ── Multi-layer orchestrator ─────────────────────────────────────────
 
 async def _run_layers(
@@ -208,6 +227,8 @@ async def _run_layers(
     """Try each enabled layer in order. Only fallback on quota errors."""
 
     layers = []
+    if getattr(config, "enable_groq", DEFAULT_ENABLE_GROQ):
+        layers.append(("Groq", "groq", getattr(config, "groq_model", DEFAULT_GROQ_MODEL)))
     if config.enable_gemini_lite:
         layers.append(("Gemini Lite", "gemini", config.gemini_lite_model))
     if config.enable_gemini_flash:
@@ -219,7 +240,9 @@ async def _run_layers(
 
     for name, provider, model in layers:
         try:
-            if provider == "gemini":
+            if provider == "groq":
+                result = await _call_groq(contents, GROQ_API_KEY)
+            elif provider == "gemini":
                 result = await _call_gemini(model, contents, temperature, max_tokens)
             else:
                 result = await _call_ollama(model, config.ollama_url, contents, temperature)
@@ -351,6 +374,8 @@ class AIService:
         """Return list of active layers for status/debugging."""
         cfg = config or ModelConfig()
         layers = []
+        if getattr(cfg, "enable_groq", DEFAULT_ENABLE_GROQ):
+            layers.append({"name": "Groq", "model": getattr(cfg, "groq_model", DEFAULT_GROQ_MODEL), "type": "cloud"})
         if cfg.enable_gemini_lite:
             layers.append({"name": "Gemini Lite", "model": cfg.gemini_lite_model, "type": "cloud"})
         if cfg.enable_gemini_flash:

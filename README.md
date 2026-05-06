@@ -119,6 +119,23 @@ ollama pull qwen2.5:1.5b
 ollama serve  # runs on localhost:11434
 ```
 
+## 🤖 Offline AI Model (Future Use)
+
+For full offline support, add a local Qwen model using one of these options:
+
+### Option 1 — GGUF (Recommended, ~350 MB total)
+pip install llama-cpp-python
+hf download Qwen/Qwen2.5-0.5B-Instruct-GGUF --local-dir ./models/qwen-gguf
+
+### Option 2 — PyTorch CPU (~1.8 GB total)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+hf download Qwen/Qwen2.5-0.5B-Instruct --local-dir ./models/qwen
+
+Note: If model is stored outside the project folder,
+update model_path in pipeline/offline_model.py to the absolute path.
+
+Current fallback chain: Groq → Gemini → sklearn (offline)
+
 ## API Endpoints
 
 ### POST /chat
