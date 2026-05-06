@@ -9,8 +9,8 @@ load_dotenv()
 
 app = FastAPI(
     title="Arak Chatbot API",
-    description="NLP microservice for Arak School Admin System",
-    version="1.0.0"
+    description="AI-powered chatbot for Arak School Admin System (Gemini + RBAC)",
+    version="2.0.0"
 )
 
 # CORS configuration
