@@ -25,7 +25,7 @@ payload = {
 
 try:
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    print(f"✓ Token generated: {token[:50]}...")
+    print(f"[OK] Token generated: {token[:50]}...")
     
     # Test the endpoint
     headers = {"Authorization": f"Bearer {token}"}
@@ -41,6 +41,6 @@ try:
     print(f"Response: {response.json()}")
     
 except Exception as e:
-    print(f"✗ Error: {e}")
+    print(f"[ERROR] Error: {e}")
     import traceback
     traceback.print_exc()

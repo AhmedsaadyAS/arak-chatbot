@@ -12,20 +12,22 @@ An intelligent assistant for the **Arak School Admin System** with **multi-layer
                          │ POST /chat { message, model_config_data }
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  Layer 1: Gemini 2.0 Flash Lite  (cloud, fastest, 30 rpm)   │
+│  Layer 1: Groq + Llama 3.3 70B   (cloud, primary, fastest)  │
+│           ↓ 429/quota/rate error                            │
+│  Layer 2: Gemini 2.0 Flash Lite  (cloud, secondary)         │
 │           ↓ 429/quota error                                 │
-│  Layer 2: Gemini 1.5 Flash       (cloud, 15 rpm)            │
+│  Layer 3: Gemini 1.5 Flash       (cloud, tertiary)          │
 │           ↓ 429/quota error                                 │
-│  Layer 3: Ollama + Qwen 2.5 1.5B (local, offline)           │
+│  Layer 4: Ollama + Qwen 2.5 1.5B (local, offline)           │
 │           ↓ all failed                                      │
-│  Layer 4: sklearn TF-IDF + LogReg (builtin, always works)   │
+│  Layer 5: sklearn TF-IDF + LogReg (builtin, always works)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Rules:**
-- Each layer can be enabled/disabled per-request from the dashboard
-- Only falls to next layer on **429 / quota errors**
-- Non-quota errors (auth, network) → raised immediately
+- Each layer can be enabled/disabled per-request from the dashboard settings panel
+- Only falls to next layer on **429 / quota / rate limit errors**
+- Non-quota errors (e.g., model not found, invalid API key) catch and safely degrade to local fallbacks
 - 60-second in-memory cache — same prompt skips all layers
 - Console logs which layer was used: `[Chatbot] Using layer: X`
 
@@ -81,14 +83,17 @@ Copy `.env.example` to `.env` and fill in:
 ARAK_API_URL=http://localhost:5000/api
 JWT_SECRET_KEY=your_jwt_secret
 GEMINI_API_KEY=your_gemini_key
+GROQ_API_KEY=your_groq_key
 
 # Layer toggles (defaults if dashboard doesn't send config)
+ENABLE_GROQ=true
 ENABLE_GEMINI_LITE=true
 ENABLE_GEMINI_FLASH=true
 ENABLE_OLLAMA=true
 ENABLE_SKLEARN=true
 
 # Model names
+GROQ_MODEL=llama-3.3-70b-versatile
 GEMINI_LITE_MODEL=gemini-2.0-flash-lite
 GEMINI_FLASH_MODEL=gemini-1.5-flash
 OLLAMA_MODEL=qwen2.5:1.5b
@@ -228,6 +233,9 @@ When clicked, shows a panel with:
 │  ⚙️ AI Model Settings              │
 ├─────────────────────────────────────┤
 │                                     │
+│  ☁️ Groq (Llama 3.3 70B)    [ON]   │
+│     Model: llama-3.3-70b-versatile  │
+│                                     │
 │  ☁️ Gemini 2.0 Flash Lite   [ON]   │
 │     Model: gemini-2.0-flash-lite    │
 │                                     │
@@ -250,10 +258,12 @@ When clicked, shows a panel with:
 // Add to ChatWidget state:
 const [showSettings, setShowSettings] = useState(false);
 const [modelConfig, setModelConfig] = useState({
+    enable_groq: true,
     enable_gemini_lite: true,
     enable_gemini_flash: true,
     enable_ollama: false,
     enable_sklearn: true,
+    groq_model: "llama-3.3-70b-versatile",
     gemini_lite_model: "gemini-2.0-flash-lite",
     gemini_flash_model: "gemini-1.5-flash",
     ollama_model: "qwen2.5:1.5b",
@@ -282,6 +292,11 @@ const toggleLayer = (key) => {
 {showSettings && (
     <div className="chat-settings-panel">
         <h4>⚙️ AI Model Settings</h4>
+        <label>
+            <input type="checkbox" checked={modelConfig.enable_groq}
+                   onChange={() => toggleLayer('enable_groq')} />
+            ☁️ Groq (Llama 3.3)
+        </label>
         <label>
             <input type="checkbox" checked={modelConfig.enable_gemini_lite}
                    onChange={() => toggleLayer('enable_gemini_lite')} />
