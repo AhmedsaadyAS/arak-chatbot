@@ -1,17 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException
+﻿from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from api.arak_client import ArakClient
 from api.ai_service import AIService, ModelConfig
 from api.auth_middleware import get_current_user
 import re
 from datetime import date
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+
 
 router = APIRouter()
 arak_client = ArakClient()
 ai = AIService()
 
+
 # ── RBAC Configuration ─────────────────────────────────────────────
+
 
 ROLE_PERMISSIONS = {
     "Super Admin": "*",  # all intents
@@ -29,13 +32,25 @@ ROLE_PERMISSIONS = {
     ],
 }
 
+
 BLOCKED_ROLES = {"Student"}
+
+
+PARENT_SAFE_MESSAGES = {
+    "attendance_missing_child": "لم أتمكن من تحديد بيانات ابنك حاليا.",
+    "attendance_missing_class": "لم أتمكن من تحديد فصل ابنك حاليا.",
+    "grade_missing_child": "لم أتمكن من تحديد بيانات ابنك حاليا.",
+    "fee_missing_child": "لم أتمكن من تحديد بيانات ابنك حاليا.",
+    "schedule_missing_class": "لم أتمكن من تحديد فصل ابنك حاليا.",
+}
+
 
 
 class ChatRequest(BaseModel):
     message: str
     token: Optional[str] = None
     model_config_data: Optional[dict] = None
+
 
 
 def check_rbac(role: str, intent: str) -> bool:
@@ -45,6 +60,7 @@ def check_rbac(role: str, intent: str) -> bool:
     if perms == "*":
         return True
     return intent in perms
+
 
 
 def extract_entities(text: str) -> Dict[str, Any]:
@@ -76,6 +92,7 @@ def extract_entities(text: str) -> Dict[str, Any]:
     return entities
 
 
+
 async def _resolve_class_id(lookup: str, token: str):
     classes = await arak_client.get_classes(token=token)
     if isinstance(classes, list):
@@ -85,9 +102,213 @@ async def _resolve_class_id(lookup: str, token: str):
     return None
 
 
+def _first_value(data: Any, *keys: str):
+    if not isinstance(data, dict):
+        return None
+
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _norm(value: Any) -> str:
+    return str(value).strip().casefold()
+
+
+def _matches_exact(candidate: Any, value: Any) -> bool:
+    if candidate in (None, "") or value in (None, ""):
+        return False
+    return _norm(candidate) == _norm(value)
+
+
+def _parent_intent_override(message: str) -> Optional[str]:
+    msg = message.casefold().strip()
+
+    if any(w in msg for w in ["غياب", "حضور", "غاب", "متغيب", "absent", "attendance"]):
+        return "attendance_query"
+    if any(w in msg for w in ["جدول", "حصص", "مواعيد", "schedule", "timetable"]):
+        return "schedule_query"
+    if any(w in msg for w in ["درجة", "درجات", "تقييم", "نتيجة", "علامة", "grade", "grades"]):
+        return "student_grade"
+    if any(w in msg for w in ["رسوم", "مصروفات", "مدفوعات", "فواتير", "fees"]):
+        return "fee_status"
+    if any(w in msg for w in ["فعالية", "فعاليات", "أحداث", "نشاط", "event"]):
+        return "event_query"
+
+    return None
+
+
+async def _resolve_parent_class_id(
+    parent_profile: Dict[str, Any],
+    matched_student: Dict[str, Any],
+    token: str,
+) -> Optional[int]:
+    existing_class_id = _first_value(matched_student, "classId", "ClassId")
+    if existing_class_id not in (None, ""):
+        try:
+            return int(existing_class_id)
+        except (TypeError, ValueError):
+            return existing_class_id
+
+    parent_id = _first_value(parent_profile, "id", "parentId")
+    if parent_id in (None, ""):
+        return None
+
+    linked_students = await arak_client.get_students_by_parent_id(parent_id, token)
+    if not isinstance(linked_students, list) or not linked_students:
+        return None
+
+    matched_student_id = _first_value(matched_student, "id", "Id")
+    lookup_values = [
+        _first_value(matched_student, "class_number", "classNumber"),
+        _first_value(matched_student, "grade", "Grade"),
+        _first_value(matched_student, "className", "ClassName"),
+        _first_value(matched_student, "class_name", "className"),
+    ]
+
+    def _linked_class_id(student: Dict[str, Any]):
+        class_id = _first_value(student, "classId", "ClassId")
+        if class_id in (None, ""):
+            return None
+        try:
+            return int(class_id)
+        except (TypeError, ValueError):
+            return class_id
+
+    for student in linked_students:
+        if _matches_exact(_first_value(student, "id", "Id"), matched_student_id):
+            class_id = _linked_class_id(student)
+            if class_id is not None:
+                return class_id
+
+    for value in lookup_values:
+        if value in (None, ""):
+            continue
+        for student in linked_students:
+            if any(
+                _matches_exact(value, candidate)
+                for candidate in (
+                    _first_value(student, "classId", "ClassId"),
+                    _first_value(student, "grade", "Grade"),
+                    _first_value(student, "className", "ClassName"),
+                )
+            ):
+                class_id = _linked_class_id(student)
+                if class_id is not None:
+                    return class_id
+
+    for value in lookup_values:
+        if value in (None, ""):
+            continue
+        for student in linked_students:
+            class_name = _first_value(student, "className", "ClassName")
+            if class_name and _norm(value) in _norm(class_name):
+                class_id = _linked_class_id(student)
+                if class_id is not None:
+                    return class_id
+
+    return None
+
+
+async def _resolve_parent_student_context(message: str, token: str) -> Dict[str, Any]:
+    parent_profile = await arak_client.get_parent_profile(token)
+    students = parent_profile.get("students", []) if isinstance(parent_profile, dict) else []
+
+    if not isinstance(students, list) or not students:
+        return {}
+
+    parent_id = _first_value(parent_profile, "id", "parentId")
+    linked_students = []
+    if parent_id not in (None, ""):
+        fetched_students = await arak_client.get_students_by_parent_id(parent_id, token)
+        if isinstance(fetched_students, list):
+            linked_students = fetched_students
+
+    msg_lower = message.lower().strip()
+    matched_student = None
+
+    for student in students:
+        candidate_names = [
+            str(student.get("name", "")).strip(),
+            str(student.get("fullName", "")).strip(),
+            str(student.get("studentName", "")).strip(),
+        ]
+
+        for candidate in candidate_names:
+            if not candidate:
+                continue
+
+            candidate_lower = candidate.lower()
+            if candidate_lower and candidate_lower in msg_lower:
+                matched_student = student
+                break
+
+            for part in candidate_lower.split():
+                if len(part) >= 3 and part in msg_lower:
+                    matched_student = student
+                    break
+
+            if matched_student:
+                break
+
+        if matched_student:
+            break
+
+    if not matched_student:
+        matched_student = students[0]
+
+    class_id = await _resolve_parent_class_id(parent_profile, matched_student, token)
+    class_number = _first_value(matched_student, "class_number", "classNumber")
+    class_name = _first_value(matched_student, "className", "class_name", "ClassName")
+
+    linked_student_record = None
+    matched_student_id = _first_value(matched_student, "id", "Id")
+    for student in linked_students:
+        if _matches_exact(_first_value(student, "id", "Id"), matched_student_id):
+            linked_student_record = student
+            break
+
+    if linked_student_record is not None and class_id is None:
+        class_id = _first_value(linked_student_record, "classId", "ClassId")
+        if class_id not in (None, ""):
+            try:
+                class_id = int(class_id)
+            except (TypeError, ValueError):
+                pass
+
+    return {
+        "studentId": matched_student.get("id"),
+        "classId": class_id,
+        "classNumber": class_number,
+        "className": class_name,
+        "studentName": matched_student.get("name")
+            or matched_student.get("fullName")
+            or matched_student.get("studentName"),
+    }
+
+
+
 # ── Intent Handlers ─────────────────────────────────────────────────
 
-async def handle_attendance_query(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
+
+async def handle_attendance_query(
+    entities: Dict,
+    token: str,
+    message: str,
+    mc: Optional[ModelConfig] = None,
+    role: Optional[str] = None,
+) -> str:
+    if role == "Parent":
+        sid = entities.get("studentId")
+        if sid:
+            data = await arak_client.get_student_attendance(sid, token)
+            if isinstance(data, dict) and "error" in data:
+                return PARENT_SAFE_MESSAGES["attendance_missing_child"]
+            return await ai.format_response("attendance_query", data, message, config=mc)
+        return PARENT_SAFE_MESSAGES["attendance_missing_child"]
+
     cid = entities.get("classId")
     if not cid and entities.get("classLookup"):
         cid = await _resolve_class_id(entities["classLookup"], token)
@@ -97,19 +318,41 @@ async def handle_attendance_query(entities: Dict, token: str, message: str, mc: 
             return "لم أتمكن من جلب بيانات الحضور. تأكد من رقم الفصل."
         return await ai.format_response("attendance_query", data, message, config=mc)
     return "من فضلك حدد رقم الفصل (مثال: غياب الفصل 1)."
-
-
-async def handle_student_grade(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
+async def handle_student_grade(
+    entities: Dict,
+    token: str,
+    message: str,
+    mc: Optional[ModelConfig] = None,
+    role: Optional[str] = None,
+) -> str:
     sid = entities.get("studentId")
+
+    if role == "Parent" and not sid:
+        return PARENT_SAFE_MESSAGES["grade_missing_child"]
+
     if sid:
         data = await arak_client.get_student_grades(sid, token)
         if isinstance(data, list) and data:
             return await ai.format_response("student_grade", data, message, config=mc)
         return "لا توجد درجات مسجلة لهذا الطالب."
-    return "من فضلك حدد رقم الطالب (مثال: درجات الطالب 5)."
 
+    return PARENT_SAFE_MESSAGES["grade_missing_child"]
+async def handle_schedule_query(
+    entities: Dict,
+    token: str,
+    message: str,
+    mc: Optional[ModelConfig] = None,
+    role: Optional[str] = None,
+) -> str:
+    if role == "Parent":
+        cid = entities.get("classId")
+        if cid:
+            data = await arak_client.get_schedules_by_class(cid, token)
+            if isinstance(data, list) and data:
+                return await ai.format_response("schedule_query", data, message, config=mc)
+            return "لا يوجد جدول حصص متاح حاليا لابنك."
+        return PARENT_SAFE_MESSAGES["schedule_missing_class"]
 
-async def handle_schedule_query(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     cid = entities.get("classId")
     if not cid and entities.get("classLookup"):
         cid = await _resolve_class_id(entities["classLookup"], token)
@@ -119,8 +362,6 @@ async def handle_schedule_query(entities: Dict, token: str, message: str, mc: Op
             return await ai.format_response("schedule_query", data, message, config=mc)
         return "لا يوجد جدول حصص لهذا الفصل."
     return "من فضلك حدد رقم الفصل (مثال: جدول الفصل 1)."
-
-
 async def handle_top_absentees(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     """Find students with the most absences."""
     classes = await arak_client.get_classes(token=token)
@@ -128,7 +369,7 @@ async def handle_top_absentees(token: str, message: str, mc: Optional[ModelConfi
         return "لم أتمكن من جلب بيانات الفصول."
 
     absence_counts = {}
-    for cls in classes[:10]:  # Limit to avoid too many API calls
+    for cls in classes[:10]:
         cid = cls.get("id")
         if not cid:
             continue
@@ -157,6 +398,7 @@ async def handle_top_absentees(token: str, message: str, mc: Optional[ModelConfi
         {"top_absentees": top_5},
         config=mc,
     )
+
 
 
 async def handle_weak_students(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
@@ -195,6 +437,7 @@ async def handle_weak_students(entities: Dict, token: str, message: str, mc: Opt
     )
 
 
+
 async def handle_class_summary(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     """Comprehensive class summary: attendance + grades + tasks."""
     cid = entities.get("classId")
@@ -203,12 +446,10 @@ async def handle_class_summary(entities: Dict, token: str, message: str, mc: Opt
     if not cid:
         return "من فضلك حدد رقم الفصل (مثال: ملخص الفصل 1)."
 
-    # Parallel data fetching
     attendance = await arak_client.get_attendance_by_class(cid, token)
     evaluations = await arak_client.get_all_evaluations(token)
     tasks = await arak_client.get_all_tasks(token)
 
-    # Filter evaluations and tasks for this class
     class_evals = []
     if isinstance(evaluations, list):
         class_evals = [e for e in evaluations if str(e.get("classId")) == str(cid)]
@@ -231,6 +472,7 @@ async def handle_class_summary(entities: Dict, token: str, message: str, mc: Opt
         summary_data,
         config=mc,
     )
+
 
 
 async def handle_unpaid_fees(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
@@ -261,6 +503,7 @@ async def handle_unpaid_fees(token: str, message: str, mc: Optional[ModelConfig]
     )
 
 
+
 async def handle_daily_summary(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     """Today's summary: attendance + events."""
     today = date.today().isoformat()
@@ -268,7 +511,6 @@ async def handle_daily_summary(token: str, message: str, mc: Optional[ModelConfi
     classes = await arak_client.get_classes(token=token)
     events = await arak_client.get_events(token)
 
-    # Get attendance for all classes today
     attendance_summary = []
     if isinstance(classes, list):
         for cls in classes[:10]:
@@ -309,19 +551,30 @@ async def handle_daily_summary(token: str, message: str, mc: Optional[ModelConfi
     )
 
 
-async def handle_fee_status(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
+
+async def handle_fee_status(
+    entities: Dict,
+    token: str,
+    message: str,
+    mc: Optional[ModelConfig] = None,
+    role: Optional[str] = None,
+) -> str:
     sid = entities.get("studentId")
     fees = await arak_client.get_all_fees(token)
+
     if not isinstance(fees, list):
         return "لم أتمكن من جلب بيانات الرسوم."
+
+    if role == "Parent" and not sid:
+        return PARENT_SAFE_MESSAGES["fee_missing_child"]
+
     if sid:
         student_fees = [f for f in fees if str(f.get("studentId")) == str(sid)]
         if student_fees:
             return await ai.format_response("fee_status", student_fees, message, config=mc)
-        return f"لا توجد رسوم مسجلة للطالب رقم {sid}."
-    return "من فضلك حدد رقم الطالب (مثال: رسوم الطالب 5)."
+        return "لا توجد رسوم مسجلة لهذا الطالب."
 
-
+    return PARENT_SAFE_MESSAGES["fee_missing_child"]
 async def handle_task_status(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     tasks = await arak_client.get_all_tasks(token)
     if not isinstance(tasks, list):
@@ -334,11 +587,13 @@ async def handle_task_status(entities: Dict, token: str, message: str, mc: Optio
     return "لا توجد مهام حاليًا."
 
 
+
 async def handle_event_query(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     events = await arak_client.get_events(token)
     if isinstance(events, list) and events:
         return await ai.format_response("event_query", events[:10], message, config=mc)
     return "لا توجد أحداث مسجلة حاليًا."
+
 
 
 async def handle_class_info(entities: Dict, token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
@@ -354,6 +609,7 @@ async def handle_class_info(entities: Dict, token: str, message: str, mc: Option
     return "لم أتمكن من جلب بيانات الفصول."
 
 
+
 async def handle_teacher_query(token: str, message: str, mc: Optional[ModelConfig] = None) -> str:
     teachers = await arak_client.get_all_teachers(token)
     if isinstance(teachers, list) and teachers:
@@ -361,24 +617,27 @@ async def handle_teacher_query(token: str, message: str, mc: Optional[ModelConfi
     return "لم أتمكن من جلب بيانات المعلمين."
 
 
+
 # ── Intent → Handler mapping ────────────────────────────────────────
-# All handlers accept (entities, token, message, mc)
+# All handlers accept (entities, token, message, mc, role)
+
 
 INTENT_HANDLERS = {
-    "attendance_query": lambda e, t, m, mc: handle_attendance_query(e, t, m, mc),
-    "student_grade":    lambda e, t, m, mc: handle_student_grade(e, t, m, mc),
-    "schedule_query":   lambda e, t, m, mc: handle_schedule_query(e, t, m, mc),
-    "top_absentees":    lambda e, t, m, mc: handle_top_absentees(t, m, mc),
-    "weak_students":    lambda e, t, m, mc: handle_weak_students(e, t, m, mc),
-    "class_summary":    lambda e, t, m, mc: handle_class_summary(e, t, m, mc),
-    "unpaid_fees":      lambda e, t, m, mc: handle_unpaid_fees(t, m, mc),
-    "daily_summary":    lambda e, t, m, mc: handle_daily_summary(t, m, mc),
-    "fee_status":       lambda e, t, m, mc: handle_fee_status(e, t, m, mc),
-    "task_status":      lambda e, t, m, mc: handle_task_status(e, t, m, mc),
-    "event_query":      lambda e, t, m, mc: handle_event_query(t, m, mc),
-    "class_info":       lambda e, t, m, mc: handle_class_info(e, t, m, mc),
-    "teacher_query":    lambda e, t, m, mc: handle_teacher_query(t, m, mc),
+    "attendance_query": lambda e, t, m, mc, r: handle_attendance_query(e, t, m, mc, r),
+    "student_grade":    lambda e, t, m, mc, r: handle_student_grade(e, t, m, mc, r),
+    "schedule_query":   lambda e, t, m, mc, r: handle_schedule_query(e, t, m, mc, r),
+    "top_absentees":    lambda e, t, m, mc, r: handle_top_absentees(t, m, mc),
+    "weak_students":    lambda e, t, m, mc, r: handle_weak_students(e, t, m, mc),
+    "class_summary":    lambda e, t, m, mc, r: handle_class_summary(e, t, m, mc),
+    "unpaid_fees":      lambda e, t, m, mc, r: handle_unpaid_fees(t, m, mc),
+    "daily_summary":    lambda e, t, m, mc, r: handle_daily_summary(t, m, mc),
+    "fee_status":       lambda e, t, m, mc, r: handle_fee_status(e, t, m, mc, r),
+    "task_status":      lambda e, t, m, mc, r: handle_task_status(e, t, m, mc),
+    "event_query":      lambda e, t, m, mc, r: handle_event_query(t, m, mc),
+    "class_info":       lambda e, t, m, mc, r: handle_class_info(e, t, m, mc),
+    "teacher_query":    lambda e, t, m, mc, r: handle_teacher_query(t, m, mc),
 }
+
 
 
 @router.post("/chat")
@@ -398,8 +657,16 @@ async def chat(request: ChatRequest, user: Dict[str, Any] = Depends(get_current_
             "entities": {},
         }
 
-    # 1. Classify intent using multi-layer AI
-    intent, layer = await ai.classify_intent(msg, config=mc)
+    # 1. Classify intent using parent override first, then AI fallback
+    if role == "Parent":
+        parent_override = _parent_intent_override(msg)
+        if parent_override:
+            intent = parent_override
+            layer = "parent_override"
+        else:
+            intent, layer = await ai.classify_intent(msg, config=mc)
+    else:
+        intent, layer = await ai.classify_intent(msg, config=mc)
 
     # 2. RBAC check
     if not check_rbac(role, intent):
@@ -412,10 +679,23 @@ async def chat(request: ChatRequest, user: Dict[str, Any] = Depends(get_current_
     # 3. Extract entities
     entities = extract_entities(msg)
 
+    if role == "Parent":
+        parent_context = await _resolve_parent_student_context(msg, token)
+        if parent_context.get("studentId") and not entities.get("studentId"):
+            entities["studentId"] = parent_context["studentId"]
+        if parent_context.get("classId") and not entities.get("classId"):
+            entities["classId"] = parent_context["classId"]
+        if parent_context.get("classNumber") and not entities.get("classNumber"):
+            entities["classNumber"] = parent_context["classNumber"]
+        if parent_context.get("className") and not entities.get("className"):
+            entities["className"] = parent_context["className"]
+        if parent_context.get("studentName"):
+            entities["studentName"] = parent_context["studentName"]
+
     # 4. Execute handler
     handler = INTENT_HANDLERS.get(intent)
     if handler:
-        reply = await handler(entities, token, msg, mc)
+        reply = await handler(entities, token, msg, mc, role)
     elif intent == "greeting":
         reply = "أهلاً وسهلاً! 👋 أنا مساعد أراك الذكي. كيف يمكنني مساعدتك اليوم؟"
     else:

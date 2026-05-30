@@ -3,15 +3,29 @@ import os
 from datetime import date
 from typing import Dict, Any, List, Optional
 
+
 class ArakClient:
     def __init__(self, base_url: str = None):
         self.base_url = base_url or os.getenv("ARAK_API_URL", "http://localhost:5000/api")
 
-    async def call_api(self, endpoint: str, method: str = "GET", params: Optional[Dict] = None, data: Optional[Dict] = None, token: Optional[str] = None) -> Any:
+    async def call_api(
+        self,
+        endpoint: str,
+        method: str = "GET",
+        params: Optional[Dict] = None,
+        data: Optional[Dict] = None,
+        token: Optional[str] = None
+    ) -> Any:
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"} if token else {}
         async with httpx.AsyncClient(timeout=15.0) as client:
             try:
-                response = await client.request(method, f"{self.base_url}/{endpoint}", params=params, json=data, headers=headers)
+                response = await client.request(
+                    method,
+                    f"{self.base_url}/{endpoint}",
+                    params=params,
+                    json=data,
+                    headers=headers
+                )
                 response.raise_for_status()
                 return response.json()
             except Exception as e:
@@ -56,10 +70,18 @@ class ArakClient:
     async def get_all_tasks(self, token: str):
         return await self.call_api("Tasks", token=token)
 
+    async def get_parent_profile(self, token: str) -> dict:
+        return await self.call_api("Parents/me", token=token)
+
+    async def get_students_by_parent_id(self, parent_id: int, token: str):
+        return await self.call_api(f"Students/SearchStudentsByParentId/{parent_id}", token=token)
+
     async def get_student_attendance(self, student_id: int, token: str, month: int = None, year: int = None):
         params = {}
-        if month: params["month"] = month
-        if year: params["year"] = year
+        if month:
+            params["month"] = month
+        if year:
+            params["year"] = year
         return await self.call_api(f"Attendance/student/{student_id}", params=params, token=token)
 
     # ── Formatters ──────────────────────────────────────────────────
@@ -72,10 +94,12 @@ class ArakClient:
             late = len([x for x in students if x.get("status") == "Late" or x.get("status") == 2])
             total = len(students)
             return f"تقرير الحضور: إجمالي {total} طالب — ✅ {present} حاضر، ❌ {absent} غائب، ⏰ {late} متأخر."
+
         if isinstance(data, list) and data:
             present = len([x for x in data if x.get("status") in ("Present", 0)])
             absent = len([x for x in data if x.get("status") in ("Absent", 1)])
             return f"تقرير الحضور: ✅ {present} حاضر، ❌ {absent} غائب."
+
         return "لم أتمكن من العثور على سجلات حضور لهذا الفصل."
 
     def format_grades(self, data: Any) -> str:
