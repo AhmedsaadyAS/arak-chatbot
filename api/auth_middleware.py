@@ -66,10 +66,13 @@ def get_current_user(request: Request) -> Dict[str, Any]:
     if isinstance(role, list):
         role = role[0] if role else None
 
-    try:
-        user_id = int(user_id)
-    except (TypeError, ValueError):
-        user_id = 0
+    # Keep GUID string or convert to int if numeric
+    if user_id is not None:
+        val_str = str(user_id).strip()
+        if val_str.isdigit():
+            user_id = int(val_str)
+        else:
+            user_id = val_str  # Keep GUID string as is (e.g., ASP.NET claims)
 
     if not role:
         raise HTTPException(

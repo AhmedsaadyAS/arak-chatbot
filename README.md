@@ -2,6 +2,34 @@
 
 An intelligent assistant for the **Arak School Admin System** with **multi-layer AI fallback** and **per-request model control** from the dashboard.
 
+## Parent Mode Resolution
+
+This branch adds a parent-only chat flow without changing Admin or Teacher routing.
+
+### Purpose
+- Make parent Arabic questions resolve deterministically before AI classification.
+- Auto-inject the linked child context so parents do not need internal IDs.
+- Derive a usable class reference for schedule queries even when `Parents/me` does not return a normalized `classId`.
+
+### Affected files
+- `api/chat_router.py` - parent intent override, parent context resolution, safer parent messages
+- `api/arak_client.py` - parent profile and parent-linked student lookup helpers
+- `api/auth_middleware.py` - token claim handling for parent JWTs with string or numeric user IDs
+
+### How the parent flow works
+1. Parent JWT is validated through the normal Bearer header.
+2. `chat_router.py` checks `role == "Parent"` and applies a deterministic intent override first.
+3. The parent profile is fetched from `/api/parents/me`.
+4. The linked child context is resolved and injected as `studentId`, `studentName`, `classNumber`, and `className`.
+5. `classId` is derived from parent-linked data when possible so schedule queries can still run.
+6. The handler runs with parent-safe messages and does not ask for internal IDs.
+
+### Intentionally not changed
+- Admin and Teacher intent classification paths.
+- RBAC rules for non-parent roles.
+- Existing dashboard chat behavior outside parent mode.
+- The backend fee permission model. If the fee feature was removed from the backend, fee responses are not expected to work and should not be treated as a chatbot regression.
+
 ## Architecture: Multi-Layer Fallback
 
 ```
@@ -141,6 +169,23 @@ update model_path in pipeline/offline_model.py to the absolute path.
 
 Current fallback chain: Groq → Gemini → sklearn (offline)
 
+## Parent Mode Verification
+
+Live verification was run against the real backend with a valid Parent Bearer token.
+
+### Result summary
+- `ما هو غياب ابني` - PASS
+- `ما هو جدول ابني` - PASS
+- `ما هي درجات ابني` - PASS
+- `ما هي رسوم ابني` - N/A if the backend fee feature was removed or is not readable by Parent
+- `هل توجد فعاليات قادمة` - PASS
+
+### Notes
+- Parent routing worked live for attendance, schedule, grades, and events.
+- The chatbot injected child context automatically.
+- The fee result depends on whether the backend still exposes a Parent-readable fee endpoint. If that feature was deleted or restricted, the chatbot is behaving as expected.
+- Before merge, Admin and Teacher flows should still be regression-tested.
+
 ## API Endpoints
 
 ### POST /chat
@@ -191,6 +236,47 @@ Returns the current default layer configuration.
 
 ### GET /health
 Health check.
+
+## Test Commands
+
+### Syntax check
+```bash
+python -m py_compile api/chat_router.py api/arak_client.py api/auth_middleware.py
+```
+
+### Local live verification
+Run the chatbot:
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+```
+
+Then test Parent mode with a valid Parent token and the five messages above using the local verification script or a manual `POST /chat` request.
+
+### Manual verification script
+```bash
+python test_chat_api.py
+```
+
+### Parent-only regression check
+Use the live verification report produced by the branch:
+```bash
+python -m py_compile api/chat_router.py api/arak_client.py
+```
+Then send:
+- `ما هو غياب ابني`
+- `ما هو جدول ابني`
+- `ما هي درجات ابني`
+- `ما هي رسوم ابني`
+- `هل توجد فعاليات قادمة`
+
+Check that Admin and Teacher messages still route exactly as before.
+
+## Merge Checklist
+
+- Re-run parent live verification with a valid Parent Bearer token.
+- Re-run Admin and Teacher regression checks before merge.
+- Confirm fees are either supported by the backend or intentionally absent.
+- Keep the parent-only intent override scoped to `role == "Parent"`.
 
 ## Per-Request Model Control (Dashboard Integration)
 
